@@ -2,6 +2,7 @@ import Check from "../Core/Check.js";
 import ComponentDatatype from "../Core/ComponentDatatype.js";
 import DeveloperError from "../Core/DeveloperError.js";
 import FeatureDetection from "../Core/FeatureDetection.js";
+import AttributeType from "../Scene/AttributeType.js";
 
 /**
  * An enum of metadata types.

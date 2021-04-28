@@ -8,7 +8,10 @@ import defined from "../Core/defined.js";
 import FeatureDetection from "../Core/FeatureDetection.js";
 import Matrix3 from "../Core/Matrix3.js";
 import Matrix4 from "../Core/Matrix4.js";
+import oneTimeWarning from "../Core/oneTimeWarning.js";
 import Quaternion from "../Core/Quaternion.js";
+import Buffer from "../Renderer/Buffer.js";
+import BufferUsage from "../Renderer/BufferUsage.js";
 import Sampler from "../Renderer/Sampler.js";
 import getAccessorByteStride from "../ThirdParty/GltfPipeline/getAccessorByteStride.js";
 import getComponentReader from "../ThirdParty/GltfPipeline/getComponentReader.js";
@@ -17,6 +20,7 @@ import when from "../ThirdParty/when.js";
 import AttributeType from "./AttributeType.js";
 import GltfFeatureMetadataLoader from "./GltfFeatureMetadataLoader.js";
 import GltfLoaderUtil from "./GltfLoaderUtil.js";
+import MetadataType from "./MetadataType.js";
 import ModelComponents from "./ModelComponents.js";
 import ResourceCache from "./ResourceCache.js";
 import ResourceLoader from "./ResourceLoader.js";
@@ -86,6 +90,7 @@ export default function GltfLoader(options) {
   this._gltfJsonLoader = undefined;
   this._state = ResourceLoaderState.UNLOADED;
   this._parsed = false;
+  this._finalize = false;
   this._promise = when.defer();
   this._texturesLoadedPromise = when.defer();
 
@@ -205,6 +210,8 @@ function handleError(gltfLoader, error) {
  * @param {FrameState} frameState The frame state.
  */
 GltfLoader.prototype.process = function (frameState) {
+  // TODO: clean up this loop
+
   //>>includeStart('debug', pragmas.debug);
   Check.typeOf.object("frameState", frameState);
   //>>includeEnd('debug');
@@ -248,6 +255,18 @@ GltfLoader.prototype.process = function (frameState) {
       ResourceCache.unload(this._gltfJsonLoader);
       this._gltfJsonLoader = undefined;
     }
+  }
+
+  if (this._readyToFinalize) {
+    this._readyToFinalize = false; // Make sure finalize is only called once
+
+    finalize(loader, frameState);
+
+    // Buffer views can be unloaded after the data has been copied
+    unloadBufferViews(loader);
+
+    loader._state = ResourceLoaderState.READY;
+    loader._promise.resolve(loader);
   }
 
   var i;
@@ -1093,11 +1112,7 @@ function parse(loader, gltf, supportedImageFormats, frameState) {
         return;
       }
 
-      // Buffer views can be unloaded after the data has been copied
-      unloadBufferViews(loader);
-
-      loader._state = ResourceLoaderState.READY;
-      loader._promise.resolve(loader);
+      loader._readyToFinalize = true;
     })
     .otherwise(function (error) {
       if (loader.isDestroyed()) {
@@ -1112,6 +1127,138 @@ function parse(loader, gltf, supportedImageFormats, frameState) {
     }
     loader._texturesLoadedPromise.resolve(loader);
   });
+}
+
+function invalidVertexAttributeProperty(property) {
+  var type = property.type;
+  var enumType = property.enumType;
+  var valueType = property.valueType;
+  var componentCount = property.componentCount;
+
+  if (
+    type === MetadataType.ARRAY &&
+    (!defined(componentCount) || componentCount > 4)
+  ) {
+    // Variable-size arrays or arrays with more than 4 components are not supported
+    return true;
+  }
+
+  if (defined(enumType)) {
+    // Enums or arrays of enums are not supported
+    return true;
+  }
+
+  if (valueType === MetadataType.STRING) {
+    // Strings or arrays of strings are not supported
+    return true;
+  }
+
+  return false;
+}
+
+function lossyVertexAttributeProperty(property) {
+  // WebGL does not support vertex attributes with these types
+  var valueType = property.valueType;
+  return (
+    valueType === MetadataType.UINT32 ||
+    valueType === MetadataType.UINT64 ||
+    valueType === MetadataType.INT32 ||
+    valueType === MetadataType.INT64 ||
+    valueType === MetadataType.FLOAT64
+  );
+}
+
+var attributeTypes = [
+  AttributeType.SCALAR,
+  AttributeType.VEC2,
+  AttributeType.VEC3,
+  AttributeType.VEC4,
+];
+
+function finalize(loader, frameState) {
+  // Convert per-vertex metadata to vertex buffers. Mainly applicable to point clouds.
+  var components = loader._components;
+  var featureMetadata = components.featureMetadata;
+  var nodes = components.nodes;
+  var nodesLength = nodes.length;
+  for (var i = 0; i < nodesLength; ++i) {
+    var node = nodes[i];
+    var primitives = node.primitives;
+    var primitivesLength = primitives.length;
+    for (var j = 0; j < primitivesLength; ++j) {
+      var primitive = primitives[j];
+      var attributes = primitive.attributes;
+      if (attributes.length === 0) {
+        continue;
+      }
+      var vertexCount = attributes[0].count;
+      var featureIdAttributes = primitive.featureIdAttributes;
+      var featureIdAttributesLength = featureIdAttributes.length;
+      for (var k = 0; k < featureIdAttributesLength; ++k) {
+        var featureIdAttribute = featureIdAttributes[k];
+        var featureTableId = featureIdAttribute.featureTable;
+        var featureTable = featureMetadata.getFeatureTable(featureTableId);
+        var featureTableClass = featureTable.class;
+        var semantic = featureIdAttribute.semantic;
+        var divisor = featureIdAttribute.divisor;
+        var constant = featureIdAttribute.constant;
+        if (defined(semantic) || divisor !== 1) {
+          continue;
+        }
+        var propertyIds = featureTable.getPropertyIds(0);
+        var propertyIdsLength = propertyIds.length;
+        for (var l = 0; l < propertyIdsLength; ++l) {
+          var propertyId = propertyIds[l];
+          var typedArray = featureTable.getPropertyTypedArray(propertyId);
+          if (!defined(typedArray)) {
+            continue;
+          }
+          var property = featureTableClass.properties[propertyId];
+          if (invalidVertexAttributeProperty(property)) {
+            continue;
+          }
+          var componentCount = property.componentCount; // TODO: check if defined for scalars
+          var startOffset = constant * componentCount;
+          var endOffset = startOffset + vertexCount * componentCount;
+          typedArray = typedArray.subarray(startOffset, endOffset);
+          if (lossyVertexAttributeProperty(property)) {
+            oneTimeWarning(
+              "Cast metadata property to floats",
+              'Feature table property "' +
+                propertyId +
+                '" will be casted to a float array because UINT32, UINT64, INT32, INT64, and FLOAT64 are not valid WebGL vertex attribute types. Some precision may be lost.'
+            );
+            typedArray = new Float32Array(typedArray);
+          }
+
+          // TODO: integrate into JobScheduler, or don't bother?
+          var vertexBuffer = Buffer.createVertexBuffer({
+            typedArray: typedArray,
+            context: frameState.context,
+            usage: BufferUsage.STATIC_DRAW,
+          });
+          vertexBuffer.vertexArrayDestroyable = false;
+
+          var metadataAttribute = new Attribute();
+          metadataAttribute.semantic = propertyId;
+          metadataAttribute.constant = undefined;
+          metadataAttribute.componentDatatype = ComponentDatatype.fromTypedArray(
+            typedArray
+          );
+          metadataAttribute.normalized = property.normalized;
+          metadataAttribute.count = vertexCount;
+          metadataAttribute.type = attributeTypes[componentCount];
+          metadataAttribute.min = undefined;
+          metadataAttribute.max = undefined;
+          metadataAttribute.byteOffset = 0;
+          metadataAttribute.byteStride = undefined;
+          metadataAttribute.buffer = vertexBuffer;
+
+          primitives.attributes.push(metadataAttribute);
+        }
+      }
+    }
+  }
 }
 
 function unloadTextures(loader) {
